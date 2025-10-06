@@ -11,7 +11,6 @@ st.set_page_config(page_title="Analizador de Créditos", layout="wide")
 # Utilidades
 # =========================
 REQ_BASE1 = ["CEDULA", "CUPO", "FECHA NACIMIENTO", "SEGMENTO"]
-# En la base 2 buscaremos por contains, porque ese campo es largo
 COL_DISTINCT = "Distinct ID"
 
 def generar_uuid_v5(cedula: str):
@@ -22,44 +21,33 @@ def generar_uuid_v5(cedula: str):
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
 
 def parse_money_to_float(x):
-    """
-    Convierte strings como '$10.000,50' | '$10,000.50' | '10000' a float.
-    Soporta formatos con . y , mezclados.
-    """
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
-    # Si ya es número, devuélvelo
     try:
         return float(s)
     except:
         pass
-
     s = s.replace("$", "").replace(" ", "")
-    # Heurística para separadores:
-    # Si hay ambas , y . asumimos US: 1,234,567.89  -> quitamos comas, punto decimal
     if "," in s and "." in s:
         s = s.replace(",", "")
         try:
             return float(s)
         except:
             return np.nan
-    # Si sólo hay comas, asumimos estilo LATAM 1.234.567,89 o 123,45
     if "," in s and "." not in s:
-        s = s.replace(".", "")      # miles
-        s = s.replace(",", ".")     # decimal
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
         try:
             return float(s)
         except:
             return np.nan
-    # Si sólo hay puntos, puede ser miles o decimal (asumimos decimal si hay uno)
     try:
         return float(s.replace(",", ""))
     except:
         return np.nan
 
 def to_datetime_safe(s):
-    # intenta dd/mm/yyyy primero, luego ISO/US
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if pd.isna(dt).all():
         dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
@@ -68,13 +56,9 @@ def to_datetime_safe(s):
 def calcular_edad(fecha_nac_series):
     fechas = to_datetime_safe(fecha_nac_series)
     hoy = pd.Timestamp.today().normalize()
-    edad = (hoy - fechas).dt.days // 365
-    return edad
+    return (hoy - fechas).dt.days // 365
 
 def find_desembolso_col(cols):
-    """
-    Busca en las columnas de base2 la que contenga 'monto_a_recibir'.
-    """
     for c in cols:
         if "monto_a_recibir" in c.lower():
             return c
@@ -84,13 +68,13 @@ def find_desembolso_col(cols):
 # UI
 # =========================
 st.title("Analizador de Créditos 🚀")
-st.caption("Sube la Base 1 (aprobados) y la Base 2 (desembolsados). La app hace hash, cruce y te muestra KPIs, gráficos y tabla.")
+st.caption("Sube la Base 1 (aprobados) y la Base 2 (desembolsados). La app hace hash, cruce y muestra KPIs, gráficos y tabla.")
 
 col_u1, col_u2 = st.columns(2)
 with col_u1:
     base1_file = st.file_uploader("Sube Base 1 (Aprobados) .xlsx", type=["xlsx"])
 with col_u2:
-    base2_file = st.file_uploader("Sube Base 2 (Desembolsados) .csv", type=["csv"])
+    base2_file = st.file_uploader("Sube Base 2 (Desembolsados) .csv / .xlsx", type=["csv", "xlsx", "xls"])
 
 if base1_file is None or base2_file is None:
     st.info("💡 Sube ambos archivos para procesar.")
@@ -112,22 +96,29 @@ if faltantes:
 
 # Hash CEDULA -> Distinct ID
 base1["Distinct ID"] = base1["CEDULA"].apply(generar_uuid_v5)
-
 # Limpiar CUPO a número
 base1["Monto_Ofertado"] = base1["CUPO"].apply(parse_money_to_float)
-
 # Edad
 base1["Edad"] = calcular_edad(base1["FECHA NACIMIENTO"])
 
 # =========================
-# Cargar y preparar Base 2
+# Cargar y preparar Base 2 (CSV o Excel)
 # =========================
+name2 = base2_file.name.lower()
 try:
-    # intenta con utf-8 y fallback latin-1 si falla
-    try:
-        base2 = pd.read_csv(base2_file, dtype=str)
-    except:
-        base2 = pd.read_csv(base2_file, dtype=str, encoding="latin-1")
+    if name2.endswith(".csv"):
+        # CSV con fallback de encoding
+        try:
+            base2 = pd.read_csv(base2_file, dtype=str)
+        except:
+            base2 = pd.read_csv(base2_file, dtype=str, encoding="latin-1")
+    else:
+        # Excel: permitir elegir hoja si hay varias
+        xls = pd.ExcelFile(base2_file)
+        sheet = xls.sheet_names[0]
+        if len(xls.sheet_names) > 1:
+            sheet = st.selectbox("Selecciona la hoja de la Base 2 (Excel):", xls.sheet_names, index=0)
+        base2 = pd.read_excel(xls, sheet_name=sheet, dtype=str)
 except Exception as e:
     st.error(f"Error leyendo Base 2: {e}")
     st.stop()
@@ -142,14 +133,16 @@ if col_desembolso is None:
     st.stop()
 
 # Normalizar tipos
-base2["Time"] = to_datetime_safe(base2.get("Time"))
+if "Time" in base2.columns:
+    base2["Time"] = to_datetime_safe(base2.get("Time"))
 base2["Monto_Desembolsado"] = base2[col_desembolso].apply(parse_money_to_float)
 
 # =========================
 # Merge y métricas
 # =========================
 df = base1.merge(
-    base2[[COL_DISTINCT, "Time", "Monto_Desembolsado"]],
+    base2[[COL_DISTINCT, "Time", "Monto_Desembolsado"]] if "Time" in base2.columns
+    else base2[[COL_DISTINCT, "Monto_Desembolsado"]],
     on=COL_DISTINCT,
     how="left"
 )
@@ -177,12 +170,13 @@ m3.metric("Total Desembolsado", f"${total_desemb:,.0f}")
 m4.metric("Tasa de Conversión", f"{tasa_conv:,.1f}%")
 
 # =========================
-# Filtros (opcionales)
+# Filtros
 # =========================
 with st.expander("🎛️ Filtros"):
     segs = sorted([s for s in df["SEGMENTO"].dropna().unique().tolist() if s != ""])
     seg_sel = st.multiselect("Segmento", segs, default=segs)
-    edad_min, edad_max = int(np.nanmin(df["Edad"])), int(np.nanmax(df["Edad"]))
+    edad_min = int(np.nanmin(df["Edad"])) if np.isfinite(np.nanmin(df["Edad"])) else 18
+    edad_max = int(np.nanmax(df["Edad"])) if np.isfinite(np.nanmax(df["Edad"])) else 80
     r_edad = st.slider("Rango de edad", min_value=0, max_value=max(18, edad_max), value=(max(18, edad_min), max(18, edad_max)))
 
 mask = (
@@ -196,7 +190,6 @@ df_f = df.loc[mask].copy()
 # =========================
 st.subheader("Gráficos")
 
-# 1) Distribución % Utilización
 col_g1, col_g2 = st.columns(2)
 with col_g1:
     aux = df_f["% Utilización"].dropna()
@@ -206,14 +199,12 @@ with col_g1:
     else:
         st.info("No hay datos para el histograma de % Utilización.")
 
-# 2) Promedio por Segmento
 with col_g2:
-    if "SEGMENTO" in df_f.columns:
+    if "SEGMENTO" in df_f.columns and len(df_f):
         seg_mean = df_f.groupby("SEGMENTO")["% Utilización"].mean().reset_index()
         fig = px.bar(seg_mean.sort_values("% Utilización"), x="% Utilización", y="SEGMENTO", orientation="h")
         st.plotly_chart(fig, use_container_width=True)
 
-# 3) Promedio por Grupo Etario
 bins = [18, 25, 35, 45, 55, 65, 120]
 labels = ["18-25", "26-35", "36-45", "46-55", "56-65", "65+"]
 df_f["Grupo_Edad"] = pd.cut(df_f["Edad"], bins=bins, labels=labels, right=True, include_lowest=True)
@@ -221,7 +212,6 @@ edad_mean = df_f.groupby("Grupo_Edad")["% Utilización"].mean().reset_index()
 fig = px.bar(edad_mean, x="Grupo_Edad", y="% Utilización")
 st.plotly_chart(fig, use_container_width=True)
 
-# 4) Ofertado vs Desembolsado (scatter)
 scatter = df_f.dropna(subset=["Monto_Ofertado", "Monto_Desembolsado"])
 if len(scatter):
     fig = px.scatter(
@@ -237,13 +227,11 @@ if len(scatter):
 # Tabla detalle
 # =========================
 st.subheader("Detalle")
-cols_show = [
-    COL_DISTINCT, "SEGMENTO", "Edad",
-    "Monto_Ofertado", "Monto_Desembolsado", "Diferencia", "% Utilización", "Time"
-]
-disp = df_f[cols_show].copy()
+cols_show = [COL_DISTINCT, "SEGMENTO", "Edad", "Monto_Ofertado", "Monto_Desembolsado", "Diferencia", "% Utilización"]
+if "Time" in df_f.columns:
+    cols_show.append("Time")
 
-# Formato amigable
+disp = df_f[cols_show].copy()
 for c in ["Monto_Ofertado", "Monto_Desembolsado", "Diferencia"]:
     disp[c] = disp[c].apply(lambda v: "" if pd.isna(v) else f"${v:,.0f}")
 disp["% Utilización"] = disp["% Utilización"].apply(lambda v: "" if pd.isna(v) else f"{v:,.1f}%")
