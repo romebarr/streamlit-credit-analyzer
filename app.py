@@ -102,7 +102,6 @@ def _guess_csv_df(fileobj):
     """
     Detecta separador automáticamente y lee CSV con fallback de encoding.
     """
-    # st.file_uploader retorna un UploadedFile (buffer). Asegurar seek.
     fileobj.seek(0)
     head = fileobj.read(4096).decode("utf-8", errors="ignore")
     # Sniffer
@@ -231,19 +230,25 @@ if base2["Monto_Desembolsado"].isna().all():
     )
 
 # =========================
-# Debug Base 2
+# Normalizar IDs y debug de cruce
 # =========================
-with st.expander("🧪 Debug Base 2"):
-    st.write("**Columna detectada de desembolso:**", col_desembolso)
-    if detected_sep is not None:
-        st.write("**Separador CSV detectado:**", detected_sep)
-    if selected_sheet is not None:
-        st.write("**Hoja seleccionada (Excel):**", selected_sheet)
-    st.write("**No nulos (raw):**", int(base2["_raw_desemb"].notna().sum()))
-    st.write("**No nulos (parseados):**", int(base2["Monto_Desembolsado"].notna().sum()))
-    st.write("**Muestras raw:**")
-    st.write(base2[["_raw_desemb"]].head(5))
-    st.write("**Suma parseada Monto_Desembolsado:**", float(base2["Monto_Desembolsado"].sum(skipna=True)))
+# Normalizar Distinct ID en ambas bases (evita espacios, mayúsculas/minúsculas)
+base1[COL_DISTINCT] = base1[COL_DISTINCT].astype(str).str.strip().str.lower()
+base2[COL_DISTINCT] = base2[COL_DISTINCT].astype(str).str.strip().str.lower()
+
+with st.expander("🔍 Debug del cruce (Distinct ID)", expanded=True):
+    total_b1 = base1[COL_DISTINCT].nunique()
+    total_b2 = base2[COL_DISTINCT].nunique()
+    inter = len(set(base1[COL_DISTINCT]).intersection(set(base2[COL_DISTINCT])))
+
+    st.write("**Distinct ID únicos (Base 1):**", total_b1)
+    st.write("**Distinct ID únicos (Base 2):**", total_b2)
+    st.write("**Intersección (IDs que matchean):**", inter)
+
+    if inter == 0:
+        st.warning("No hay intersección de IDs. Revisa la lógica de hash o el normalizado de IDs.")
+        st.write("**Ejemplos Base 1 (primeros 5):**", base1[COL_DISTINCT].head(5).tolist())
+        st.write("**Ejemplos Base 2 (primeros 5):**", base2[COL_DISTINCT].head(5).tolist())
 
 # =========================
 # Merge y métricas
@@ -252,22 +257,26 @@ cols_b2 = [COL_DISTINCT, "Monto_Desembolsado"]
 if "Time" in base2.columns:
     cols_b2.append("Time")
 
-df = base1.merge(base2[cols_b2], on=COL_DISTINCT, how="left")
+# df_all: mantiene todos los aprobados (para tasa de conversión)
+df_all = base1.merge(base2[cols_b2], on=COL_DISTINCT, how="left")
 
-df["Diferencia"] = df["Monto_Ofertado"] - df["Monto_Desembolsado"]
-df["% Utilización"] = np.where(
-    df["Monto_Ofertado"] > 0,
-    (df["Monto_Desembolsado"] / df["Monto_Ofertado"]) * 100,
+df_all["Diferencia"] = df_all["Monto_Ofertado"] - df_all["Monto_Desembolsado"]
+df_all["% Utilización"] = np.where(
+    df_all["Monto_Ofertado"] > 0,
+    (df_all["Monto_Desembolsado"] / df_all["Monto_Ofertado"]) * 100,
     np.nan
 )
 
+# df_acc: solo los que desembolsaron (IDs de Base 2)
+df_acc = df_all[df_all["Monto_Desembolsado"].notna() & (df_all["Monto_Desembolsado"] > 0)].copy()
+
 # =========================
-# Panel de métricas
+# Panel de métricas (sobre df_all)
 # =========================
-total_ofertado = df["Monto_Ofertado"].sum(skipna=True)
-total_desemb = df["Monto_Desembolsado"].sum(skipna=True)
-prom_util = df["% Utilización"].mean(skipna=True)
-tasa_conv = (df["Monto_Desembolsado"].notna() & (df["Monto_Desembolsado"] > 0)).mean() * 100
+total_ofertado = df_all["Monto_Ofertado"].sum(skipna=True)
+total_desemb = df_all["Monto_Desembolsado"].sum(skipna=True)
+prom_util = df_all["% Utilización"].mean(skipna=True)
+tasa_conv = (df_all["Monto_Desembolsado"].notna() & (df_all["Monto_Desembolsado"] > 0)).mean() * 100
 
 st.subheader("Resumen")
 m1, m2, m3, m4 = st.columns(4)
@@ -277,29 +286,36 @@ m3.metric("Total Desembolsado", f"${total_desemb:,.0f}")
 m4.metric("Tasa de Conversión", f"{tasa_conv:,.1f}%")
 
 # =========================
-# Filtros
+# Filtros (aplican a ambos dataframes)
 # =========================
 with st.expander("🎛️ Filtros"):
-    segs = sorted([s for s in df["SEGMENTO"].dropna().unique().tolist() if str(s).strip() != ""]) if "SEGMENTO" in df.columns else []
+    segs = sorted([s for s in df_all["SEGMENTO"].dropna().unique().tolist() if str(s).strip() != ""]) if "SEGMENTO" in df_all.columns else []
     seg_sel = st.multiselect("Segmento", segs, default=segs) if segs else []
-    edad_min = int(np.nanmin(df["Edad"])) if np.isfinite(np.nanmin(df["Edad"])) else 18
-    edad_max = int(np.nanmax(df["Edad"])) if np.isfinite(np.nanmax(df["Edad"])) else 80
-    r_edad = st.slider("Rango de edad", min_value=0, max_value=max(18, edad_max), value=(max(18, edad_min), max(18, edad_max)))
+    edad_min = int(np.nanmin(df_all["Edad"])) if np.isfinite(np.nanmin(df_all["Edad"])) else 18
+    edad_max = int(np.nanmax(df_all["Edad"])) if np.isfinite(np.nanmax(df_all["Edad"])) else 80
+    r_edad = st.slider("Rango de edad", min_value=0, max_value=max(18, edad_max),
+                       value=(max(18, edad_min), max(18, edad_max)))
 
-mask = (
-    (df["SEGMENTO"].isin(seg_sel) if seg_sel else True) &
-    df["Edad"].between(r_edad[0], r_edad[1], inclusive="both")
+mask_all = (
+    (df_all["SEGMENTO"].isin(seg_sel) if seg_sel else True) &
+    df_all["Edad"].between(r_edad[0], r_edad[1], inclusive="both")
 )
-df_f = df.loc[mask].copy()
+mask_acc = (
+    (df_acc["SEGMENTO"].isin(seg_sel) if seg_sel else True) &
+    df_acc["Edad"].between(r_edad[0], r_edad[1], inclusive="both")
+)
+
+df_all_f = df_all.loc[mask_all].copy()
+df_acc_f = df_acc.loc[mask_acc].copy()
 
 # =========================
-# Gráficos
+# Gráficos (sobre df_all filtrado)
 # =========================
 st.subheader("Gráficos")
 
 col_g1, col_g2 = st.columns(2)
 with col_g1:
-    aux = df_f["% Utilización"].dropna()
+    aux = df_all_f["% Utilización"].dropna()
     if len(aux):
         fig = px.histogram(aux, x="% Utilización", nbins=30)
         st.plotly_chart(fig, use_container_width=True)
@@ -307,19 +323,19 @@ with col_g1:
         st.info("No hay datos para el histograma de % Utilización.")
 
 with col_g2:
-    if "SEGMENTO" in df_f.columns and len(df_f):
-        seg_mean = df_f.groupby("SEGMENTO")["% Utilización"].mean().reset_index()
+    if "SEGMENTO" in df_all_f.columns and len(df_all_f):
+        seg_mean = df_all_f.groupby("SEGMENTO")["% Utilización"].mean().reset_index()
         fig = px.bar(seg_mean.sort_values("% Utilización"), x="% Utilización", y="SEGMENTO", orientation="h")
         st.plotly_chart(fig, use_container_width=True)
 
 bins = [18, 25, 35, 45, 55, 65, 120]
 labels = ["18-25", "26-35", "36-45", "46-55", "56-65", "65+"]
-df_f["Grupo_Edad"] = pd.cut(df_f["Edad"], bins=bins, labels=labels, right=True, include_lowest=True)
-edad_mean = df_f.groupby("Grupo_Edad")["% Utilización"].mean().reset_index()
+df_all_f["Grupo_Edad"] = pd.cut(df_all_f["Edad"], bins=bins, labels=labels, right=True, include_lowest=True)
+edad_mean = df_all_f.groupby("Grupo_Edad")["% Utilización"].mean().reset_index()
 fig = px.bar(edad_mean, x="Grupo_Edad", y="% Utilización")
 st.plotly_chart(fig, use_container_width=True)
 
-scatter = df_f.dropna(subset=["Monto_Ofertado", "Monto_Desembolsado"])
+scatter = df_all_f.dropna(subset=["Monto_Ofertado", "Monto_Desembolsado"])
 if len(scatter):
     fig = px.scatter(
         scatter,
@@ -331,13 +347,14 @@ if len(scatter):
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Tabla detalle
+# Tabla detalle (SOLO IDs que desembolsaron)
 # =========================
-st.subheader("Detalle")
+st.subheader("Detalle — Solo clientes con desembolso (Base 2)")
+
 cols_show = [COL_DISTINCT, "SEGMENTO", "Edad", "Monto_Ofertado", "Monto_Desembolsado", "Diferencia", "% Utilización"]
-if "Time" in df_f.columns:
+if "Time" in df_acc_f.columns:
     cols_show.append("Time")
-disp = df_f[cols_show].copy()
+disp = df_acc_f[cols_show].copy()
 
 # Formato amigable
 for c in ["Monto_Ofertado", "Monto_Desembolsado", "Diferencia"]:
