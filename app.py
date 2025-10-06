@@ -17,13 +17,13 @@ COL_DISTINCT = "Distinct ID"
 # =========================
 # Utilidades
 # =========================
-def generar_uuid_v5(cedula: str):
-    """Hash v5 usando la lógica: {cedula} + 'CED' + {primeros 3 dígitos}"""
+def generar_uuid_v5_default(cedula: str):
+    """Lógica original: {cedula} + 'CED' + {primeros 3 dígitos}, namespace DNS."""
     cedula = str(cedula or "").strip()
     if len(cedula) < 3:
-        return None
+        return ""
     name = f"{cedula}CED{cedula[:3]}"
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))  # mantiene guiones, lowercase
 
 def parse_money_to_float(x):
     """
@@ -33,48 +33,40 @@ def parse_money_to_float(x):
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
-
-    # limpia símbolos de moneda/espacios raros
     s = (s.replace("$", "")
            .replace("€", "")
            .replace(" ", "")
-           .replace("\xa0", "")  # NBSP
+           .replace("\xa0", "")
            .replace("’", "")
            .replace("'", ""))
 
-    # número simple con punto decimal
     if re.fullmatch(r"-?\d+(\.\d+)?", s):
         try:
             return float(s)
         except:
             return np.nan
 
-    # sólo comas (LATAM)
     if "," in s and "." not in s:
-        s = s.replace(".", "")      # miles
-        s = s.replace(",", ".")     # decimal
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
         try:
             return float(s)
         except:
             return np.nan
 
-    # punto y coma a la vez: decidir por el último separador
     if "." in s and "," in s:
         last_dot = s.rfind(".")
         last_com = s.rfind(",")
         if last_com > last_dot:
-            # decimal con coma
-            s = s.replace(".", "")   # miles
-            s = s.replace(",", ".")  # decimal
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
         else:
-            # decimal con punto
-            s = s.replace(",", "")   # miles
+            s = s.replace(",", "")
         try:
             return float(s)
         except:
             return np.nan
 
-    # sólo puntos (pueden ser miles): unir si hay muchos
     parts = s.split(".")
     if len(parts) > 2:
         s = "".join(parts)
@@ -95,22 +87,22 @@ def calcular_edad(fecha_nac_series):
     return (hoy - fechas).dt.days // 365
 
 def _clean_cols(df: pd.DataFrame):
+    # Solo limpia encabezados (NO toca valores)
     df.columns = [c.strip() for c in df.columns]
     return df
 
 def _guess_csv_df(fileobj):
     """
     Detecta separador automáticamente y lee CSV con fallback de encoding.
+    NO toca valores de columnas.
     """
     fileobj.seek(0)
     head = fileobj.read(4096).decode("utf-8", errors="ignore")
-    # Sniffer
     try:
         dialect = csv.Sniffer().sniff(head, delimiters=",;|\t")
         sep = dialect.delimiter
     except Exception:
         sep = ";" if head.count(";") > head.count(",") else ","
-    # volver a inicio y leer
     fileobj.seek(0)
     try:
         df = pd.read_csv(fileobj, dtype=str, sep=sep)
@@ -120,9 +112,6 @@ def _guess_csv_df(fileobj):
     return _clean_cols(df), sep
 
 def _find_desembolso_col(cols):
-    """
-    Busca columna de desembolso con patrones comunes.
-    """
     patterns = [
         r"monto[_\s]*a[_\s]*recibir",
         r"desembols",
@@ -136,11 +125,61 @@ def _find_desembolso_col(cols):
                 return c
     return None
 
+# ======= HASH CANDIDATES (Auto-detección SIN normalizar IDs) =======
+NAMESPACES = {
+    "DNS": uuid.NAMESPACE_DNS,
+    "URL": uuid.NAMESPACE_URL,
+    "OID": uuid.NAMESPACE_OID,
+    "X500": uuid.NAMESPACE_X500,
+}
+def name_formula(ced: str, variant: str) -> str:
+    if variant == "ced+CED+first3":
+        return f"{ced}CED{ced[:3]}"
+    if variant == "ced+CED+last3":
+        return f"{ced}CED{ced[-3:]}"
+    if variant == "ced:CED:first3":
+        return f"{ced}:CED:{ced[:3]}"
+    if variant == "ced-ced-first3":
+        return f"{ced}-CED-{ced[:3]}"
+    if variant == "cedcedfirst3_lowerced":
+        return f"{ced}ced{ced[:3]}"
+    return f"{ced}CED{ced[:3]}"
+
+FORMULAS = [
+    "ced+CED+first3",
+    "ced+CED+last3",
+    "ced:CED:first3",
+    "ced-ced-first3",
+    "cedcedfirst3_lowerced",
+]
+
+def hash_with(cedula: str, ns_key: str, formula_key: str) -> str:
+    ced = str(cedula or "").strip()
+    if len(ced) < 3:
+        return ""
+    nm = name_formula(ced, formula_key)
+    return str(uuid.uuid5(NAMESPACES[ns_key], nm))  # mantiene guiones
+
+def autodetect_hash_exact(base1_ced_series: pd.Series, base2_ids_exact_set: set, sample_n: int = 300):
+    """
+    Prueba combinaciones de namespace x fórmula sobre una muestra de cédulas,
+    y compara EXACTAMENTE contra los Distinct ID de Base 2 (sin normalizar).
+    """
+    sample = base1_ced_series.dropna().astype(str).unique()[:sample_n]
+    results = []
+    for ns in NAMESPACES.keys():
+        for fm in FORMULAS:
+            gen = [hash_with(ced, ns, fm) for ced in sample]  # string con guiones
+            inter = len(set(gen).intersection(base2_ids_exact_set))
+            results.append((ns, fm, inter))
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
 # =========================
 # UI
 # =========================
 st.title("Analizador de Créditos 🚀")
-st.caption("Sube la Base 1 (aprobados) y la Base 2 (desembolsados). Se hace hash, cruce y se muestran KPIs, gráficos y tabla.")
+st.caption("Sube la Base 1 (aprobados) y la Base 2 (desembolsados). Se hace hash (sin alterar el formato del ID), cruce y se muestran KPIs, gráficos y tabla.")
 
 col_u1, col_u2 = st.columns(2)
 with col_u1:
@@ -157,7 +196,7 @@ if base1_file is None or base2_file is None:
 # =========================
 try:
     base1 = pd.read_excel(base1_file, dtype=str)
-    base1 = _clean_cols(base1)
+    base1 = _clean_cols(base1)  # limpia solo encabezados
 except Exception as e:
     st.error(f"Error leyendo Base 1: {e}")
     st.stop()
@@ -167,11 +206,8 @@ if faltantes:
     st.error(f"En Base 1 faltan columnas requeridas: {faltantes}")
     st.stop()
 
-# Hash CEDULA -> Distinct ID
-base1[COL_DISTINCT] = base1["CEDULA"].apply(generar_uuid_v5)
-# Limpiar CUPO a número
+# Cálculos base (NO tocamos Distinct ID aún)
 base1["Monto_Ofertado"] = base1["CUPO"].apply(parse_money_to_float)
-# Edad
 base1["Edad"] = calcular_edad(base1["FECHA NACIMIENTO"])
 
 # =========================
@@ -195,7 +231,7 @@ except Exception as e:
     st.error(f"Error leyendo Base 2: {e}")
     st.stop()
 
-# Normalizamos nombres clave
+# Distinct ID debe existir (NO lo tocamos)
 if COL_DISTINCT not in base2.columns:
     candidatas = [c for c in base2.columns if c.strip().lower().replace(" ", "") in ("distinctid", "distinct_id")]
     if candidatas:
@@ -205,59 +241,91 @@ if COL_DISTINCT not in base2.columns:
     st.error(f"En Base 2 no se encontró la columna '{COL_DISTINCT}'. Revisa el nombre exacto.")
     st.stop()
 
+# Detectar columna de desembolso
 col_desembolso = _find_desembolso_col(base2.columns)
 if col_desembolso is None:
-    st.error("En Base 2 no encontré la columna de desembolso (busco 'monto_a_recibir', 'desembols*', etc.). Renombra o verifica el archivo.")
+    st.error("En Base 2 no encontré la columna de desembolso (busco 'monto_a_recibir', 'desembols*', etc.).")
     st.stop()
 
-# Tipos y parseo de montos
+# Parseo de Time y monto (NO tocamos valores de Distinct ID)
 if "Time" in base2.columns:
     base2["Time"] = to_datetime_safe(base2.get("Time"))
 
-# Copia raw para debug
 base2["_raw_desemb"] = base2[col_desembolso]
 base2["Monto_Desembolsado"] = base2[col_desembolso].apply(parse_money_to_float)
-
-# Fallback si todo quedó NaN
 if base2["Monto_Desembolsado"].isna().all():
     base2["Monto_Desembolsado"] = pd.to_numeric(
         base2[col_desembolso]
         .astype(str)
         .str.replace(r"[\$\s]", "", regex=True)
-        .str.replace(".", "", regex=False)  # miles
-        .str.replace(",", ".", regex=False),  # decimal
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False),
         errors="coerce"
     )
 
 # =========================
-# Normalizar IDs y debug de cruce
+# Debug Base 2 (parseo)
 # =========================
-# Normalizar Distinct ID en ambas bases (evita espacios, mayúsculas/minúsculas)
-base1[COL_DISTINCT] = base1[COL_DISTINCT].astype(str).str.strip().str.lower()
-base2[COL_DISTINCT] = base2[COL_DISTINCT].astype(str).str.strip().str.lower()
+with st.expander("🧪 Debug Base 2 (parseo)", expanded=False):
+    st.write("**Columna detectada de desembolso:**", col_desembolso)
+    if detected_sep is not None:
+        st.write("**Separador CSV detectado:**", detected_sep)
+    if selected_sheet is not None:
+        st.write("**Hoja seleccionada (Excel):**", selected_sheet)
+    st.write("**No nulos (raw):**", int(base2["_raw_desemb"].notna().sum()))
+    st.write("**No nulos (parseados):**", int(base2["Monto_Desembolsado"].notna().sum()))
+    st.write("**Muestras raw:**")
+    st.write(base2[["_raw_desemb"]].head(5))
+    st.write("**Suma parseada Monto_Desembolsado:**", float(base2["Monto_Desembolsado"].sum(skipna=True)))
 
-with st.expander("🔍 Debug del cruce (Distinct ID)", expanded=True):
+# =========================
+# AUTODETECCIÓN de HASH (sin normalizar Distinct ID)
+# =========================
+b2_ids_exact_set = set(base2[COL_DISTINCT].dropna().astype(str))
+
+tests = autodetect_hash_exact(base1["CEDULA"], b2_ids_exact_set, sample_n=500)
+
+with st.expander("🧬 Auto-detección de hash (namespace + fórmula)", expanded=True):
+    if len(tests):
+        df_tests = pd.DataFrame(tests, columns=["Namespace", "Fórmula", "Matches (muestra)"])
+        st.dataframe(df_tests, use_container_width=True)
+    else:
+        st.write("Sin tests disponibles.")
+
+best_ns, best_fm, best_inter = tests[0] if tests else ("DNS", "ced+CED+first3", 0)
+
+if best_inter == 0:
+    st.error("No hubo matches en la auto-detección de hash. El Distinct ID de la Base 2 podría no provenir de la cédula con UUID v5 (o usa otra fórmula/namespace).")
+    # Aun así generamos con la fórmula por defecto para continuar con la interfaz
+    base1[COL_DISTINCT] = base1["CEDULA"].apply(generar_uuid_v5_default)
+else:
+    st.success(f"Mejor combinación detectada: Namespace={best_ns} | Fórmula={best_fm} (matches en muestra: {best_inter})")
+    base1[COL_DISTINCT] = base1["CEDULA"].apply(lambda c: hash_with(c, best_ns, best_fm))
+
+# =========================
+# Debug del cruce (EXACTO, sin normalizar IDs)
+# =========================
+with st.expander("🔍 Debug del cruce (Distinct ID exacto)", expanded=True):
     total_b1 = base1[COL_DISTINCT].nunique()
     total_b2 = base2[COL_DISTINCT].nunique()
-    inter = len(set(base1[COL_DISTINCT]).intersection(set(base2[COL_DISTINCT])))
+    inter = len(set(base1[COL_DISTINCT]).intersection(b2_ids_exact_set))
 
     st.write("**Distinct ID únicos (Base 1):**", total_b1)
     st.write("**Distinct ID únicos (Base 2):**", total_b2)
-    st.write("**Intersección (IDs que matchean):**", inter)
+    st.write("**Intersección (IDs que matchean, exactos):**", inter)
 
     if inter == 0:
-        st.warning("No hay intersección de IDs. Revisa la lógica de hash o el normalizado de IDs.")
+        st.warning("Sigue sin haber intersección exacta. Verifica que Base 2 realmente use UUID v5 derivado de la cédula con la misma fórmula/namespace.")
         st.write("**Ejemplos Base 1 (primeros 5):**", base1[COL_DISTINCT].head(5).tolist())
         st.write("**Ejemplos Base 2 (primeros 5):**", base2[COL_DISTINCT].head(5).tolist())
 
 # =========================
-# Merge y métricas
+# Merge y métricas (match EXACTO)
 # =========================
 cols_b2 = [COL_DISTINCT, "Monto_Desembolsado"]
 if "Time" in base2.columns:
     cols_b2.append("Time")
 
-# df_all: mantiene todos los aprobados (para tasa de conversión)
 df_all = base1.merge(base2[cols_b2], on=COL_DISTINCT, how="left")
 
 df_all["Diferencia"] = df_all["Monto_Ofertado"] - df_all["Monto_Desembolsado"]
@@ -267,7 +335,7 @@ df_all["% Utilización"] = np.where(
     np.nan
 )
 
-# df_acc: solo los que desembolsaron (IDs de Base 2)
+# Solo los que desembolsaron (IDs Base 2)
 df_acc = df_all[df_all["Monto_Desembolsado"].notna() & (df_all["Monto_Desembolsado"] > 0)].copy()
 
 # =========================
@@ -286,7 +354,7 @@ m3.metric("Total Desembolsado", f"${total_desemb:,.0f}")
 m4.metric("Tasa de Conversión", f"{tasa_conv:,.1f}%")
 
 # =========================
-# Filtros (aplican a ambos dataframes)
+# Filtros
 # =========================
 with st.expander("🎛️ Filtros"):
     segs = sorted([s for s in df_all["SEGMENTO"].dropna().unique().tolist() if str(s).strip() != ""]) if "SEGMENTO" in df_all.columns else []
@@ -347,18 +415,15 @@ if len(scatter):
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Tabla detalle (SOLO IDs que desembolsaron)
+# Tabla detalle — Solo colocados (IDs Base 2, tal cual)
 # =========================
 st.subheader("Detalle — Solo clientes con desembolso (Base 2)")
-
 cols_show = [COL_DISTINCT, "SEGMENTO", "Edad", "Monto_Ofertado", "Monto_Desembolsado", "Diferencia", "% Utilización"]
 if "Time" in df_acc_f.columns:
     cols_show.append("Time")
-disp = df_acc_f[cols_show].copy()
 
-# Formato amigable
+disp = df_acc_f[cols_show].copy()
 for c in ["Monto_Ofertado", "Monto_Desembolsado", "Diferencia"]:
     disp[c] = disp[c].apply(lambda v: "" if pd.isna(v) else f"${v:,.0f}")
 disp["% Utilización"] = disp["% Utilización"].apply(lambda v: "" if pd.isna(v) else f"{v:,.1f}%")
-
 st.dataframe(disp, use_container_width=True)
