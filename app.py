@@ -257,12 +257,32 @@ st.plotly_chart(fig, use_container_width=True)
 # TABLA FINAL
 # =========================
 st.subheader("📋 Detalle — Solo clientes con desembolso (Base 2)")
-cols_show = [COL_DISTINCT, "SEGMENTO", "Edad", "Monto_Ofertado", "Monto_Desembolsado", "Diferencia", "% Utilización"]
+
+# Incluimos CÉDULA para poder validar manualmente
+cols_show = [
+    "CEDULA",
+    COL_DISTINCT,
+    "SEGMENTO",
+    "Edad",
+    "Monto_Ofertado",
+    "Monto_Desembolsado",
+    "Diferencia",
+    "% Utilización"
+]
 if "Time" in df_des_f.columns:
     cols_show.append("Time")
 
+# Verificamos que las columnas existan
+cols_show = [c for c in cols_show if c in df_des_f.columns]
+
 disp = df_des_f[cols_show].copy()
+
+# Formateo visual
 for c in ["Monto_Ofertado", "Monto_Desembolsado", "Diferencia"]:
-    disp[c] = disp[c].apply(lambda v: "" if pd.isna(v) else f"${v:,.0f}")
-disp["% Utilización"] = disp["% Utilización"].apply(lambda v: "" if pd.isna(v) else f"{v:,.1f}%")
+    if c in disp.columns:
+        disp[c] = disp[c].apply(lambda v: "" if pd.isna(v) else f"${v:,.0f}")
+
+if "% Utilización" in disp.columns:
+    disp["% Utilización"] = disp["% Utilización"].apply(lambda v: "" if pd.isna(v) else f"{v:,.1f}%")
+
 st.dataframe(disp, use_container_width=True)
